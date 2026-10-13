@@ -1,0 +1,4 @@
+# Runtime: standard library only. LangGraph is optional; a built-in equivalent runner is used if absent.
+langgraph>=0.2
+# Dev
+pytest>=8
