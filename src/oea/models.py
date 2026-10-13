@@ -1,4 +1,4 @@
-"""Typed domain objects shared across agents, tools, policy and audit."""
+"""Typed domain objects shared across workflow steps, tools, policy and audit."""
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -30,7 +30,7 @@ class ActionType(str, Enum):
     RESCHEDULE = "reschedule"
     UPGRADE_SHIPPING = "upgrade_shipping"
     ESCALATE = "escalate"                 # no ERP write; routes to a human queue
-    CANCEL_ORDER = "cancel_order"         # agents may propose, policy always denies
+    CANCEL_ORDER = "cancel_order"         # may be proposed; policy always denies
 
 
 class Decision(str, Enum):
@@ -75,7 +75,7 @@ class Proposal:
     rationale: str
     confidence: float
     value_at_stake: float
-    agent: str
+    handler: str
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

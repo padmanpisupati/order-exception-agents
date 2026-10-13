@@ -1,4 +1,4 @@
-"""Run the workflow over open orders and print an operational summary.
+"""Run the governed exception workflow over open orders and print an operational summary.
 
 Usage: python -m oea.demo [--data PATH] [--limit N] [--no-langgraph]
 """
@@ -12,7 +12,7 @@ from pathlib import Path
 from .audit import AuditLog
 from .data import load_dataco
 from .erp import MockERP
-from .graph import build_graph, run_case
+from .graph import build_workflow, run_case
 from .hitl import SimulatedApprover
 from .llm import RuleBasedLLM
 
@@ -32,7 +32,7 @@ def main(argv=None) -> dict:
     synthetic = path == SAMPLE
     orders = load_dataco(path, limit=a.limit)
     erp, audit = MockERP(orders), AuditLog(a.out / "audit.jsonl")
-    app, engine = build_graph(erp, RuleBasedLLM(), SimulatedApprover(), audit,
+    app, engine = build_workflow(erp, RuleBasedLLM(), SimulatedApprover(), audit,
                               use_langgraph=not a.no_langgraph)
     t0, results, lat = time.perf_counter(), [], []
     for o in orders:

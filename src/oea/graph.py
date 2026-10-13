@@ -1,15 +1,22 @@
-"""Workflow graph: supervisor -> specialist -> policy gate -> (execute | HITL | escalate)
--> back to supervisor until the exception queue is empty.
+"""Governed exception-handling workflow (deterministic, no supervisor agent).
 
-Uses LangGraph's StateGraph when installed; otherwise a minimal equivalent runner
-with the same node/edge semantics (see ADR-0001).
+    intake -> next_exception -> handle -> policy_gate -> (execute | human_review | escalate)
+           -> next_exception ... -> finalize
+
+`next_exception` is a cursor over the priority-ordered exception list produced by
+`detect_exceptions`; it makes no judgement calls. `handle` dispatches to the
+matching handler function via the static `HANDLERS` table. Every path to an ERP
+write passes the policy gate. See ADR-0006 for why this replaced the
+supervisor/specialist pattern of ADR-0001.
+
+Uses LangGraph's StateGraph when installed (optional engine); otherwise a minimal
+equivalent runner with the same node/edge semantics. A test checks parity.
 """
 from __future__ import annotations
 import time
 from typing import Any, Callable, TypedDict
 
-from .agents import (CreditAgent, FraudRouter, InventoryAgent, LateDeliveryAgent,
-                     PricingAgent, detect_exceptions)
+from .handlers import HANDLERS, detect_exceptions
 from .audit import AuditLog
 from .erp import MockERP
 from .hitl import Approver
@@ -66,20 +73,9 @@ class MiniGraph:
         return state
 
 
-SPECIALIST_NODE = {
-    ExceptionType.FRAUD_REVIEW.value: "fraud_router",
-    ExceptionType.CREDIT_HOLD.value: "credit_agent",
-    ExceptionType.PRICING_MISMATCH.value: "pricing_agent",
-    ExceptionType.INVENTORY_SHORTFALL.value: "inventory_agent",
-    ExceptionType.LATE_DELIVERY_RISK.value: "late_delivery_agent",
-}
-
-
-def build_graph(erp: MockERP, llm: LLMClient, approver: Approver, audit: AuditLog,
-                use_langgraph: bool | None = None):
-    agents = {"credit_agent": CreditAgent(erp, llm), "inventory_agent": InventoryAgent(erp, llm),
-              "late_delivery_agent": LateDeliveryAgent(erp, llm),
-              "pricing_agent": PricingAgent(erp, llm), "fraud_router": FraudRouter()}
+def build_workflow(erp: MockERP, llm: LLMClient, approver: Approver, audit: AuditLog,
+                   use_langgraph: bool | None = None):
+    """Compile the workflow. Returns (app, engine_name)."""
     proposals: dict[str, Any] = {}  # case_id -> live Proposal object
 
     def intake(s: CaseState):
@@ -88,29 +84,30 @@ def build_graph(erp: MockERP, llm: LLMClient, approver: Approver, audit: AuditLo
         audit.append("intake", s["case_id"], {"order_status": o.order_status, "exceptions": q})
         return {"queue": q, "outcomes": [], "current": None}
 
-    def supervisor(s: CaseState):
+    def next_exception(s: CaseState):
         if not s["queue"]:
             return {"route": "done", "current": None}
         cur, rest = s["queue"][0], s["queue"][1:]
-        audit.append("route", s["case_id"], {"exception": cur, "to": SPECIALIST_NODE[cur]})
-        return {"current": cur, "queue": rest, "route": SPECIALIST_NODE[cur]}
+        fn = HANDLERS[ExceptionType(cur)]
+        audit.append("dispatch", s["case_id"], {"exception": cur, "handler": fn.__name__})
+        return {"current": cur, "queue": rest, "route": "handle"}
 
-    def make_specialist(name):
-        def node(s: CaseState):
-            o = erp.read_order(s["order_item_id"])
-            p = agents[name].propose(o)
-            if p is None:
-                audit.append("no_action", s["case_id"], {"agent": name, "exception": s["current"]})
-                outs = s["outcomes"] + [{"exception": s["current"], "status": "cleared_on_check"}]
-                return {"proposal": None, "outcomes": outs}
-            proposals[s["case_id"]] = p
-            audit.append("proposal", s["case_id"], p.to_dict())
-            return {"proposal": p.to_dict()}
-        return node
+    def handle(s: CaseState):
+        o = erp.read_order(s["order_item_id"])
+        fn = HANDLERS[ExceptionType(s["current"])]
+        p = fn(o, erp, llm)
+        if p is None:
+            audit.append("no_action", s["case_id"], {"handler": fn.__name__,
+                                                     "exception": s["current"]})
+            outs = s["outcomes"] + [{"exception": s["current"], "status": "cleared_on_check"}]
+            return {"proposal": None, "outcomes": outs}
+        proposals[s["case_id"]] = p
+        audit.append("proposal", s["case_id"], p.to_dict())
+        return {"proposal": p.to_dict()}
 
     def policy_gate(s: CaseState):
         if s.get("proposal") is None:
-            return {"route": "supervisor"}
+            return {"route": "next_exception"}
         p = proposals[s["case_id"]]
         r = pol.evaluate(p, erp.read_order(s["order_item_id"]))
         audit.append("policy", s["case_id"], {"decision": r.decision.value, "rules": r.rule_ids,
@@ -131,7 +128,7 @@ def build_graph(erp: MockERP, llm: LLMClient, approver: Approver, audit: AuditLo
         outs = s["outcomes"] + [{"exception": p.exception.value, "action": p.action.value,
                                  "status": "rejected_by_human", "role": role,
                                  "value_at_stake": p.value_at_stake}]
-        return {"route": "supervisor", "outcomes": outs}
+        return {"route": "next_exception", "outcomes": outs}
 
     def execute(s: CaseState):
         p = proposals[s["case_id"]]
@@ -160,26 +157,27 @@ def build_graph(erp: MockERP, llm: LLMClient, approver: Approver, audit: AuditLo
     lg = HAVE_LANGGRAPH if use_langgraph is None else (use_langgraph and HAVE_LANGGRAPH)
     g = StateGraph(CaseState) if lg else MiniGraph(CaseState)
     end = LG_END if lg else END
-    for n, fn in [("intake", intake), ("supervisor", supervisor), ("policy_gate", policy_gate),
-                  ("human_review", human_review), ("execute", execute),
-                  ("escalate", escalate), ("finalize", finalize)]:
+    for n, fn in [("intake", intake), ("next_exception", next_exception), ("handle", handle),
+                  ("policy_gate", policy_gate), ("human_review", human_review),
+                  ("execute", execute), ("escalate", escalate), ("finalize", finalize)]:
         g.add_node(n, fn)
-    for name in agents:
-        g.add_node(name, make_specialist(name))
-        g.add_edge(name, "policy_gate")
     g.set_entry_point("intake")
-    g.add_edge("intake", "supervisor")
-    g.add_conditional_edges("supervisor", lambda s: s["route"],
-                            {**{a: a for a in agents}, "done": "finalize"})
+    g.add_edge("intake", "next_exception")
+    g.add_conditional_edges("next_exception", lambda s: s["route"],
+                            {"handle": "handle", "done": "finalize"})
+    g.add_edge("handle", "policy_gate")
     g.add_conditional_edges("policy_gate", lambda s: s["route"],
                             {"execute": "execute", "human_review": "human_review",
-                             "escalate": "escalate", "supervisor": "supervisor"})
+                             "escalate": "escalate", "next_exception": "next_exception"})
     g.add_conditional_edges("human_review", lambda s: s["route"],
-                            {"execute": "execute", "supervisor": "supervisor"})
-    g.add_edge("execute", "supervisor")
-    g.add_edge("escalate", "supervisor")
+                            {"execute": "execute", "next_exception": "next_exception"})
+    g.add_edge("execute", "next_exception")
+    g.add_edge("escalate", "next_exception")
     g.add_edge("finalize", end)
     return g.compile(), ("langgraph" if lg else "minigraph")
+
+
+build_graph = build_workflow  # backward-compatible name
 
 
 def run_case(app, order_item_id: int) -> dict:

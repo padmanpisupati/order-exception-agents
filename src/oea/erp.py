@@ -1,4 +1,4 @@
-"""Mock ERP adapter. Tool interfaces mirror what an agent would call against a real
+"""Mock ERP adapter. Tool interfaces mirror what the workflow (or an optional LLM tool-caller) would call against a real
 ERP (order read, credit check, ATP, reschedule/split, price-override request).
 
 Reads are free; writes are only reachable through `execute()`, which the graph

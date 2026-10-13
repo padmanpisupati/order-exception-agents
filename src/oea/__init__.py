@@ -1,3 +1,3 @@
-"""Order Exception Agents: reference implementation of a governed multi-agent
-order-exception workflow (supervisor + specialists + policy gate + HITL + audit)."""
-__version__ = "0.1.0"
+"""Order exception handling: reference implementation of a governed, deterministic
+workflow (detect -> handler -> policy gate -> HITL -> execute/escalate -> audit)."""
+__version__ = "0.2.0"

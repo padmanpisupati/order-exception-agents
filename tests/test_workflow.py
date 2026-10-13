@@ -4,11 +4,11 @@ from pathlib import Path
 import pytest
 
 from oea import policy
-from oea.agents import detect_exceptions
+from oea.handlers import HANDLERS, detect_exceptions
 from oea.audit import AuditLog
 from oea.data import DATACO_COLUMNS, generate_synthetic, load_dataco, read_rows, to_order
 from oea.erp import MockERP
-from oea.graph import HAVE_LANGGRAPH, build_graph, run_case
+from oea.graph import HAVE_LANGGRAPH, MiniGraph, build_workflow, run_case
 from oea.hitl import AutoReject, SimulatedApprover
 from oea.llm import RuleBasedLLM
 from oea.models import ActionType, Decision, ExceptionType, Proposal
@@ -27,7 +27,7 @@ def mk(base, **kw):
 
 def app_for(orders, approver=None, engine=None):
     erp, audit = MockERP(orders), AuditLog()
-    app, _ = build_graph(erp, RuleBasedLLM(), approver or SimulatedApprover(), audit,
+    app, _ = build_workflow(erp, RuleBasedLLM(), approver or SimulatedApprover(), audit,
                          use_langgraph=engine)
     return app, erp, audit
 
@@ -90,7 +90,7 @@ def test_no_writes_on_closed_orders(base):
     assert policy.evaluate(_p(ActionType.RESCHEDULE), o).decision == Decision.DENY
 
 
-# --- end-to-end graph ---
+# --- end-to-end workflow ---
 def test_fraud_never_writes(base):
     o = mk(base, order_status="SUSPECTED_FRAUD")
     app, erp, audit = app_for([o])
@@ -152,3 +152,34 @@ def test_langgraph_and_minigraph_agree():
         app, _, _ = app_for(orders, engine=eng)
         res[eng] = [run_case(app, o.order_item_id)["outcomes"] for o in orders]
     assert res[True] == res[False]
+
+
+# --- workflow shape (ADR-0006) ---
+def test_every_exception_type_has_exactly_one_handler():
+    assert set(HANDLERS) == set(ExceptionType)
+
+
+def test_workflow_has_no_supervisor_or_agent_nodes():
+    erp, audit = MockERP([]), AuditLog()
+    app, _ = build_workflow(erp, RuleBasedLLM(), SimulatedApprover(), audit, use_langgraph=False)
+    assert isinstance(app, MiniGraph)
+    assert set(app.nodes) == {"intake", "next_exception", "handle", "policy_gate",
+                              "human_review", "execute", "escalate", "finalize"}
+
+
+def test_handlers_follow_priority_order_in_audit(base):
+    o = mk(base, order_status="ON_HOLD", late_delivery_risk=1, quantity=1,
+           discount_rate=0.25, item_total=round(base.unit_price * 0.75, 2))
+    app, erp, audit = app_for([o])
+    run_case(app, o.order_item_id)
+    seq = [r["payload"]["exception"] for r in audit.records if r["event"] == "dispatch"]
+    assert seq == ["credit_hold", "pricing_mismatch", "late_delivery_risk"]
+
+
+def test_workflow_is_deterministic():
+    orders = load_dataco(SAMPLE)
+    runs = []
+    for _ in range(2):
+        app, erp, _ = app_for(orders, engine=False)
+        runs.append(([run_case(app, o.order_item_id)["outcomes"] for o in orders], erp.write_log))
+    assert runs[0] == runs[1]

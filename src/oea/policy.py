@@ -5,7 +5,7 @@ from __future__ import annotations
 from .models import ActionType, Decision, ExceptionType, Order, PolicyResult, Proposal
 
 POLICY_VERSION = "2026.10-ref"
-AUTO_LIMITS = {  # max value an agent may action without a human
+AUTO_LIMITS = {  # max value the workflow may action without a human
     ActionType.RELEASE_CREDIT_HOLD: 1000.0,
     ActionType.RESCHEDULE: 2500.0,
     ActionType.SPLIT_SHIPMENT: 2500.0,
